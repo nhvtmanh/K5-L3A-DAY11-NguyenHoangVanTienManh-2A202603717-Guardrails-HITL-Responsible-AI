@@ -13,6 +13,8 @@ from google.adk import runners
 from google.adk.plugins import base_plugin
 
 from core.utils import chat_with_agent
+from core.config import DEMO_SECRETS
+from agents.security_boundary import normalize_for_security
 
 
 # ============================================================
@@ -37,18 +39,29 @@ def content_filter(response: str) -> dict:
         dict with 'safe', 'issues', and 'redacted' keys
     """
     issues = []
+    response = normalize_for_security(response)
     redacted = response
 
-    # PII patterns to check
+    # Match complete identifiers and redact larger secrets before phone numbers.
     PII_PATTERNS = {
-        # TODO: Add regex patterns for:
-        # - VN phone number: r"0\d{9,10}"
-        # - Email: r"[\w.-]+@[\w.-]+\.[a-zA-Z]{2,}"
-        # - National ID (CMND/CCCD): r"\b\d{9}\b|\b\d{12}\b"
-        # - API key pattern: r"sk-[a-zA-Z0-9-]+"
-        # - Password pattern: r"password\s*[:=]\s*\S+"
+        "email": r"[\w.+-]+@[\w.-]+\.[a-zA-Z]{2,}",
+        "password": r"\bpassword\s*(?:[:=]|\bis\b)\s*\S+",
+        "api_key": r"\bsk-[a-zA-Z0-9-]+",
+        "protected_value": "|".join(
+            re.escape(value) for value in sorted(DEMO_SECRETS, key=len, reverse=True)
+        ) or r"(?!)",
+        "vn_phone": (
+            r"(?<![\w+])(?:0|(?:\+|00)84)[ .-]*[1-9]"
+            r"(?:[ .-]*\d){8,9}(?!\w)"
+        ),
+        "national_id": r"\b(?:\d{9}|\d{12})\b",
+        # Basic harmful phrases; this is not a semantic safety classifier.
+        "harmful_content": (
+            r"\b(?:make|build)\s+(?:a\s+)?bomb\b"
+            r"|\b(?:hack|steal)\s+(?:(?:a|an|the)\s+)?"
+            r"(?:bank\s+)?(?:account|password)s?\b"
+        ),
     }
-
     for name, pattern in PII_PATTERNS.items():
         matches = re.findall(pattern, response, re.IGNORECASE)
         if matches:
@@ -172,16 +185,27 @@ class OutputGuardrailPlugin(base_plugin.BasePlugin):
         if not response_text:
             return llm_response
 
-        # TODO: Implement logic:
-        # 1. Call content_filter(response_text)
-        #    - If issues found: replace llm_response.content with redacted version
-        #    - Increment self.redacted_count
-        # 2. If use_llm_judge: call llm_safety_check(response_text)
-        #    - If unsafe: replace llm_response.content with a safe message
-        #    - Increment self.blocked_count
-        # 3. Return llm_response (possibly modified)
+        filter_result = content_filter(response_text)
+        if not filter_result["safe"]:
+            llm_response.content = types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=filter_result["redacted"])],
+            )
+            self.redacted_count += 1
 
-        return llm_response  # TODO: modify if needed
+        if self.use_llm_judge:
+            # Judge the original response so redaction does not hide its intent.
+            safety_result = await llm_safety_check(response_text)
+            if not safety_result["safe"]:
+                llm_response.content = types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(
+                        text="I cannot provide this response because it did not pass the safety check. Please ask a banking-related question."
+                    )],
+                )
+                self.blocked_count += 1
+
+        return llm_response
 
 
 # ============================================================
